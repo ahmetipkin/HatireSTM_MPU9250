@@ -26,7 +26,7 @@ typedef struct {
 } _msginfo;
 
 typedef struct {
-    float orientation[3];
+    imu::Quaternion baseQuat;
 
     float magBias[3];
     float magScale[3];
@@ -64,7 +64,6 @@ void setup() {
     pinMode(CAL_BUTTON, INPUT_PULLDOWN);
 
     Serial.begin();
-    delay(2000);
     PrintCodeSerial(2000, Version, true);
 
     hatire.Begin = 0xAAAA;
@@ -75,17 +74,19 @@ void setup() {
     msginfo.Code = 0;
     msginfo.End = 0x5555;
 
+    PrintCodeSerial(3002, "Initializing EEPROM", true);
+    EEPROM.begin();
+    PrintCodeSerial(3001, "Initializing I2C", true);
     Wire.begin();
 
-    PrintCodeSerial(3001, "Initializing I2C", true);
+    mpu.setScales(MPU9250::AFS_2G, MPU9250::GFS_250DPS, MPU9250::MFS_16BITS, MPU9250::M_100HZ);
 
+    PrintCodeSerial(3001, "Initializing MPU", true);
     if (!mpu.begin()) {
         PrintCodeSerial(9007, "MPU9250 ERROR", true);
     } else {
         PrintCodeSerial(3003, "MPU9250 OK", true);
         mpuReady = true;
-        PrintCodeSerial(3002, "Initializing EEPROM", true);
-        EEPROM.begin();
 
         ReadParams();
 
@@ -107,6 +108,13 @@ void calibrate() {
     AskCalibrate = true;
 }
 
+float ax, ay, az, gx, gy, gz, mx, my, mz;
+float sum = 0.0f;
+
+bool yesdebug = false;
+
+uint32_t count = 0, sumCount = 0;  // used to control display output rate
+
 // The loop function is called in an endless loop
 void loop() {
 //Add your repeated code here
@@ -119,142 +127,84 @@ void loop() {
 
     if (mpuReady) {
 
-        if (!mpu.dataReady()) {
-            return;
+        if (mpu.dataReady()) {
+
+            mpu.readAcceleration(ax, ay, az);
+            mpu.readGyro(gx, gy, gz);
         }
 
-        float ax, ay, az, gx, gy, gz, mx, my, mz;
+        mpu.readMagnet(mx, my, mz);
 
-        mpu.readAcceleration(ax, ay, az);
-        mpu.readGyro(gx, gy, gz);
-        bool res = mpu.readMagnet(mx, my, mz);
-
-        if (!res)
-            return;
+        //if (!mpu.readMagnet(mx, my, mz))
+        //    return;
 
         uint32_t Now = micros();
         // Set integration time by time elapsed since last filter update
         double deltat = ((Now - lastUpdate) / 1000000.0f); // set integration time by time elapsed since last filter update
         lastUpdate = Now;
 
-        // ENU orientation with chip inverse with FSYNC pin to north: -- misaligns the chip but stable
-        //MadgwickQuaternionUpdate(ax, -ay, -az, gx * PI / 180.0f, -gy * PI / 180.0f, -gz * PI / 180.0f, my, -mx, mz,
-        //deltat);
+        sum += deltat; // sum for averaging filter update rate
+        sumCount++;
 
-        // NWU orientation with chip inverse with FSYNC pin to north: works good
-        MadgwickQuaternionUpdate(-ay, -ax, -az, -gy * PI / 180.0f, -gx * PI / 180.0f, -gz * PI / 180.0f, -mx, -my, mz,
-                deltat);
+        // NWU orientation with chip inverse with FSYNC pin to north
+        MahonyQuaternionUpdate(-ay, -ax, -az, -gy * PI / 180.0f, -gx * PI / 180.0f, -gz * PI / 180.0f, -mx, -my, mz, deltat);
 
         // NWU orientation with chip correct. VCC to North - works
         //MadgwickQuaternionUpdate(ay, -ax, az, gy * PI / 180.0f, -gx * PI / 180.0f, gz * PI / 180.0f, mx, -my, -mz, deltat);
 
         // NWU orientation with chip looks to east. VCC to North
-        //MadgwickQuaternionUpdate(ay, az, ax, gy * PI / 180.0f, gz * PI / 180.0f, gx * PI / 180.0f, mx, -mz, my, deltat);
+        //MahonyQuaternionUpdate(ay, az, ax, gy * PI / 180.0f, gz * PI / 180.0f, gx * PI / 180.0f, mx, -mz, my, deltat);
+
+        // NWU orientation with FSYNC bottom; gyro Z+ to north
+        //MadgwickQuaternionUpdate(az, ax, ay, gz * PI / 180.0f, gx * PI / 180.0f, gy * PI / 180.0f, -mz, my, mx, deltat);
 
         if (active) {
 
             const float *q = getQ();
-            //format : yaw, pitch, roll;
 
-            float pitch, yaw, roll;
-            float a12, a22, a31, a32, a33;       // rotation matrix coefficients for Euler angles and gravity components
-            float lin_ax, lin_ay, lin_az;        // linear acceleration (acceleration with gravity component subtracted)
-
-            a12 = 2.0f * (q[1] * q[2] + q[0] * q[3]);
-            a22 = q[0] * q[0] + q[1] * q[1] - q[2] * q[2] - q[3] * q[3];
-            a31 = 2.0f * (q[0] * q[1] + q[2] * q[3]);
-            a32 = 2.0f * (q[1] * q[3] - q[0] * q[2]);
-            a33 = q[0] * q[0] - q[1] * q[1] - q[2] * q[2] + q[3] * q[3];
-            pitch = -asinf(a32);
-            roll = atan2f(a31, a33);
-            yaw = atan2f(a12, a22);
-            pitch *= 180.0f / PI;
-            yaw *= 180.0f / PI;
-            roll *= 180.0f / PI;
-
-            lin_ax = ax + a31;
-            lin_ay = ay + a32;
-            lin_az = az - a33;
+            imu::Quaternion sensorQuat = imu::Quaternion(q[0], q[1], q[2], q[3]);
 
             if (debug) {
-                /*
-                 Serial.println("RAW:");
+                uint32_t delt_t = millis() - count;
+                if (delt_t > 500) {
+                    yesdebug = true;
+                }
+            }
 
-                 Serial.print("ax = ");
-                 Serial.print((int) 1000 * ax);
-                 Serial.print(" ay = ");
-                 Serial.print((int) 1000 * ay);
-                 Serial.print(" az = ");
-                 Serial.print((int) 1000 * az);
-
-                 Serial.print(" gx = ");
-                 Serial.print(gx, 2);
-                 Serial.print(" gy = ");
-                 Serial.print(gy);
-                 Serial.print(" gz = ");
-                 Serial.print(gz, 2);
-
-                 Serial.print(" mx = ");
-                 Serial.print((int) mx);
-                 Serial.print(" my = ");
-                 Serial.print((int) my);
-                 Serial.print(" mz = ");
-                 Serial.println((int) mz);
-
-                 Serial.println("QUAT:");
-                 Serial.print("w:");
-                 Serial.print(q[0]);
-                 Serial.print(" x:");
-                 Serial.print(q[1]);
-                 Serial.print(" y:");
-                 Serial.print(q[2]);
-                 Serial.print(" z:");
-                 Serial.println(q[3]);
-
-                 Serial.println("EULER :");
-                 Serial.print("Yaw(X):");
-                 Serial.print(yaw);
-                 Serial.print(" Pitch(Y):");
-                 Serial.print(pitch);
-                 Serial.print(" Roll(Z):");
-                 Serial.println(roll);
-                 */
-
-                Serial.print(mx, 3);
+            if (yesdebug) {
+                Serial.print(1000 * ax, 2);
                 Serial.print(", ");
-                Serial.print(my, 3);
+                Serial.print(1000 * ay, 2);
                 Serial.print(", ");
-                Serial.println(mz, 3);
+                Serial.print(1000 * az, 2);
+                Serial.print(", ");
 
-                /*
-                 imu::Vector<3> myVec = imu::Quaternion(q[0], q[1], q[2], q[3]).toEuler();
+                Serial.print(gx, 2);
+                Serial.print(", ");
+                Serial.print(gy);
+                Serial.print(", ");
+                Serial.print(gz, 2);
+                Serial.print(", ");
 
-                 Serial.println("*MY* EULER:");
-                 Serial.print("Yaw(X):");
-                 Serial.print(myVec.x() * 180.0f / M_PI);
-                 Serial.print(" Pitch(Y):");
-                 Serial.print(myVec.y() * 180.0f / M_PI);
-                 Serial.print(" Roll(Z):");
-                 Serial.println(myVec.z() * 180.0f / M_PI);
-                 */
+                Serial.print(mx, 2);
+                Serial.print(", ");
+                Serial.print(my, 2);
+                Serial.print(", ");
+                Serial.print(mz, 2);
+                Serial.print(" || ");
 
+                Serial.print((float) sumCount / sum, 2);
+                Serial.print(" Hz");
+
+                digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+
+                sumCount = 0;
+                sum = 0;
             }
 
             if (AskCalibrate) {
-                if (CptCal >= NbCal) {
-                    CptCal = 0;
-                    calibrationOffsets.orientation[0] = calibrationOffsets.orientation[0] / NbCal;
-                    calibrationOffsets.orientation[1] = calibrationOffsets.orientation[1] / NbCal;
-                    calibrationOffsets.orientation[2] = calibrationOffsets.orientation[2] / NbCal;
-                    AskCalibrate = false;
-                    SaveParams();
-                } else {
-                    calibrationOffsets.orientation[0] += yaw;
-                    calibrationOffsets.orientation[1] += pitch;
-                    calibrationOffsets.orientation[2] += roll;
 
-                    CptCal++;
-                }
+                calibrationOffsets.baseQuat = sensorQuat;
 
                 hatire.gyro[0] = 0;
                 hatire.gyro[1] = 0;
@@ -262,44 +212,94 @@ void loop() {
                 hatire.acc[0] = 0;
                 hatire.acc[1] = 0;
                 hatire.acc[2] = 0;
+
+                SaveParams();
+
+                AskCalibrate = false;
+
             } else {
+
+                // calculate Bt * q * B  to change basis:
+                // note that we can do this because sensor output quaternions are always unit size.
+                const imu::Quaternion &baseQ = calibrationOffsets.baseQuat;
+                imu::Quaternion calibratedQ2 = baseQ.conjugate() * sensorQuat;
+                //imu::Quaternion calibratedQ1 = calibratedQ1 * baseQ;
+
+                if (yesdebug) {
+
+                    Serial.print(" || ");
+                    Serial.print(sensorQuat.w());
+                    Serial.print(", ");
+                    Serial.print(sensorQuat.x());
+                    Serial.print(", ");
+                    Serial.print(sensorQuat.y());
+                    Serial.print(", ");
+                    Serial.print(sensorQuat.z());
+
+                    Serial.print(" || ");
+                    Serial.print(baseQ.w());
+                    Serial.print(", ");
+                    Serial.print(baseQ.x());
+                    Serial.print(", ");
+                    Serial.print(baseQ.y());
+                    Serial.print(", ");
+                    Serial.print(baseQ.z());
+                    /*
+                     Serial.print(" || ");
+                     Serial.print(calibratedQ1.w());
+                     Serial.print(", ");
+                     Serial.print(calibratedQ1.x());
+                     Serial.print(", ");
+                     Serial.print(calibratedQ1.y());
+                     Serial.print(", ");
+                     Serial.print(calibratedQ1.z());
+                     */
+                    Serial.print(" || ");
+                    Serial.print(calibratedQ2.w());
+                    Serial.print(", ");
+                    Serial.print(calibratedQ2.x());
+                    Serial.print(", ");
+                    Serial.print(calibratedQ2.y());
+                    Serial.print(", ");
+                    Serial.print(calibratedQ2.z());
+                }
+
                 //send order : yaw, pitch, roll
-                float rawYaw = yaw - calibrationOffsets.orientation[0];
-                float rawPitch = pitch - calibrationOffsets.orientation[1];
-                float rawRoll = roll - calibrationOffsets.orientation[2];
+                imu::Vector<3> euler = calibratedQ2.toEuler();
 
-                hatire.gyro[0] = rawYaw > 180.0f ? rawYaw - 360.0f : rawYaw;
-                hatire.gyro[1] = rawPitch > 90.0f ? 180.0f - rawPitch : rawPitch;
-                hatire.gyro[2] = rawRoll > 180.0f ? rawRoll - 360.0f : rawRoll;
+                hatire.gyro[0] = euler.x() * 180 / M_PI;
+                hatire.gyro[1] = euler.y() * 180 / M_PI;
+                hatire.gyro[2] = euler.z() * 180 / M_PI;
 
-                hatire.acc[0] = lin_ax;
-                hatire.acc[1] = lin_ay;
-                hatire.acc[2] = lin_az;
+                hatire.acc[0] = 0;
+                hatire.acc[1] = 0;
+                hatire.acc[2] = 0;
 
             }
-            if (!debug)
 
+            if (!yesdebug && !debug) {
                 Serial.write((byte*) &hatire, 30);
 
-            else {
-                /*
-                 Serial.println("CALCULATED:");
-                 Serial.print("Yaw(X):");
-                 Serial.print(hatire.gyro[0]);
-                 Serial.print(" Pitch(Y):");
-                 Serial.print(hatire.gyro[1]);
-                 Serial.print(" Roll(Z):");
-                 Serial.println(hatire.gyro[2]);
-                 */
+                hatire.Cpt++;
+                if (hatire.Cpt > 999) {
+                    hatire.Cpt = 0;
+                }
+
+            } else if (yesdebug) {
+                Serial.print(" || ");
+                Serial.print(hatire.gyro[0]);
+                Serial.print(", ");
+                Serial.print(hatire.gyro[1]);
+                Serial.print(", ");
+                Serial.println(hatire.gyro[2]);
             }
 
-            hatire.Cpt++;
-            if (hatire.Cpt > 999) {
-                hatire.Cpt = 0;
-            }
+            if (yesdebug)
+                count = millis();
+
+            yesdebug = false;
         }
     }
-
 }
 
 // ================================================================
@@ -369,7 +369,7 @@ void serialEvent() {
             } else {
                 PrintCodeSerial(3005, "Calibration Sequence", true);
 
-                mpu.calibrateSensors();
+                mpu.calibrateSensors(MPU9250::AXIS_Z);
                 SaveParams();
 
                 PrintCodeSerial(3007, "Calibration Complete", false);
@@ -380,13 +380,16 @@ void serialEvent() {
             Serial.println();
             Serial.print("Version : \t");
             Serial.println(Version);
-            Serial.println("Gyroscopes offsets");
-            Serial.print("Yaw: ");
-            Serial.println(calibrationOffsets.orientation[0]);
-            Serial.print("Pitch : ");
-            Serial.println(calibrationOffsets.orientation[1]);
-            Serial.print("Roll: ");
-            Serial.println(calibrationOffsets.orientation[2]);
+            Serial.println("Base Quaternion");
+            imu::Quaternion &baseQ = calibrationOffsets.baseQuat;
+            Serial.print("W: ");
+            Serial.print(baseQ.w());
+            Serial.print(" X : ");
+            Serial.print(baseQ.x());
+            Serial.print(" Y: ");
+            Serial.print(baseQ.y());
+            Serial.print(" Z: ");
+            Serial.println(baseQ.z());
 
             Serial.println("Magnetometer bias");
             Serial.print("X : ");
@@ -439,7 +442,7 @@ void PrintCodeSerial(uint16_t code, const char Msg[24], bool EOL) {
     strcpy(msginfo.Msg, Msg);
     if (EOL)
         msginfo.Msg[23] = 0x0A;
-    // Send HATIRE message to  PC
+// Send HATIRE message to  PC
     Serial.write((byte*) &msginfo, 30);
 }
 
@@ -447,9 +450,7 @@ void PrintCodeSerial(uint16_t code, const char Msg[24], bool EOL) {
 // ===                    DELETE OFFSETS                        ===
 // ================================================================
 void clearOffsets() {
-    calibrationOffsets.orientation[0] = 0;
-    calibrationOffsets.orientation[1] = 0;
-    calibrationOffsets.orientation[2] = 0;
+    calibrationOffsets.baseQuat = imu::Quaternion();
 }
 
 // ================================================================
