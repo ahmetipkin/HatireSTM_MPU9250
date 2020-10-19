@@ -16,14 +16,14 @@ typedef struct {
     float gyro[3];   // 12 [Y, P, R]    gyro
     float acc[3];    // 12 [x, y, z]    Acc
     int16_t End;      // 2  Fin
-} _hatire;
+} _HatirePacket;
 
 typedef struct {
     int16_t Begin;   // 2  Debut
     uint16_t Code;     // 2  Code info
     char Msg[24];   // 24 Message
     int16_t End;      // 2  Fin
-} _msginfo;
+} HatireMessage;
 
 typedef struct {
     imu::Quaternion baseQuat;
@@ -33,23 +33,21 @@ typedef struct {
     float gyroBias[3];
     float accelBias[3];
 
-} _eprom_save;
+} CalibrationData;
 
 char Version[] = "HAT V 1.10";
 
 MPU9250 mpu = MPU9250();
 
-_eprom_save calibrationOffsets;
+CalibrationData calibrationOffsets;
 
 // Control/status vars
-bool debug = false;
+bool debugMode = false;
 bool mpuReady = false;
 bool active = false;
 
-uint8_t devStatus;      // return status after each device operation (0 = success, !0 = error)
-
-_hatire hatire;
-_msginfo msginfo;
+_HatirePacket hatire;
+HatireMessage msginfo;
 
 bool AskCalibrate = false;  // set true when calibrating is ask
 int CptCal = 0;
@@ -111,7 +109,7 @@ void calibrate() {
 float ax, ay, az, gx, gy, gz, mx, my, mz;
 float sum = 0.0f;
 
-bool yesdebug = false;
+bool printDebug = false;
 
 uint32_t count = 0, sumCount = 0;  // used to control display output rate
 
@@ -128,15 +126,11 @@ void loop() {
     if (mpuReady) {
 
         if (mpu.dataReady()) {
-
             mpu.readAcceleration(ax, ay, az);
             mpu.readGyro(gx, gy, gz);
         }
 
         mpu.readMagnet(mx, my, mz);
-
-        //if (!mpu.readMagnet(mx, my, mz))
-        //    return;
 
         uint32_t Now = micros();
         // Set integration time by time elapsed since last filter update
@@ -147,10 +141,12 @@ void loop() {
         sumCount++;
 
         // NWU orientation with chip inverse with FSYNC pin to north
-        MahonyQuaternionUpdate(-ay, -ax, -az, -gy * PI / 180.0f, -gx * PI / 180.0f, -gz * PI / 180.0f, -mx, -my, mz, deltat);
+        //MahonyQuaternionUpdate(-ay, -ax, -az, -gy * PI / 180.0f, -gx * PI / 180.0f, -gz * PI / 180.0f, -mx, -my, mz, deltat);
 
-        // NWU orientation with chip correct. VCC to North - works
-        //MadgwickQuaternionUpdate(ay, -ax, az, gy * PI / 180.0f, -gx * PI / 180.0f, gz * PI / 180.0f, mx, -my, -mz, deltat);
+        // NWU orientation
+        //MahonyQuaternionUpdate(ay, -ax, az, gy * PI / 180.0f, -gx * PI / 180.0f, gz * PI / 180.0f, mx, -my, -mz, deltat);
+
+        MadgwickQuaternionUpdate(-ay, az, -ax, -gy * PI / 180.0f, gz * PI / 180.0f, -gx * PI / 180.0f, -mx, -mz, -my, deltat);
 
         // NWU orientation with chip looks to east. VCC to North
         //MahonyQuaternionUpdate(ay, az, ax, gy * PI / 180.0f, gz * PI / 180.0f, gx * PI / 180.0f, mx, -mz, my, deltat);
@@ -164,14 +160,14 @@ void loop() {
 
             imu::Quaternion sensorQuat = imu::Quaternion(q[0], q[1], q[2], q[3]);
 
-            if (debug) {
+            if (debugMode) {
                 uint32_t delt_t = millis() - count;
                 if (delt_t > 500) {
-                    yesdebug = true;
+                    printDebug = true;
                 }
             }
 
-            if (yesdebug) {
+            if (printDebug) {
                 Serial.print(1000 * ax, 2);
                 Serial.print(", ");
                 Serial.print(1000 * ay, 2);
@@ -219,13 +215,12 @@ void loop() {
 
             } else {
 
-                // calculate Bt * q * B  to change basis:
+                // calculate Bt * q  to change basis:
                 // note that we can do this because sensor output quaternions are always unit size.
                 const imu::Quaternion &baseQ = calibrationOffsets.baseQuat;
                 imu::Quaternion calibratedQ2 = baseQ.conjugate() * sensorQuat;
-                //imu::Quaternion calibratedQ1 = calibratedQ1 * baseQ;
 
-                if (yesdebug) {
+                if (printDebug) {
 
                     Serial.print(" || ");
                     Serial.print(sensorQuat.w());
@@ -244,16 +239,6 @@ void loop() {
                     Serial.print(baseQ.y());
                     Serial.print(", ");
                     Serial.print(baseQ.z());
-                    /*
-                     Serial.print(" || ");
-                     Serial.print(calibratedQ1.w());
-                     Serial.print(", ");
-                     Serial.print(calibratedQ1.x());
-                     Serial.print(", ");
-                     Serial.print(calibratedQ1.y());
-                     Serial.print(", ");
-                     Serial.print(calibratedQ1.z());
-                     */
                     Serial.print(" || ");
                     Serial.print(calibratedQ2.w());
                     Serial.print(", ");
@@ -277,7 +262,7 @@ void loop() {
 
             }
 
-            if (!yesdebug && !debug) {
+            if (!printDebug && !debugMode) {
                 Serial.write((byte*) &hatire, 30);
 
                 hatire.Cpt++;
@@ -285,7 +270,7 @@ void loop() {
                     hatire.Cpt = 0;
                 }
 
-            } else if (yesdebug) {
+            } else if (printDebug) {
                 Serial.print(" || ");
                 Serial.print(hatire.gyro[0]);
                 Serial.print(", ");
@@ -294,10 +279,10 @@ void loop() {
                 Serial.println(hatire.gyro[2]);
             }
 
-            if (yesdebug)
+            if (printDebug)
                 count = millis();
 
-            yesdebug = false;
+            printDebug = false;
         }
     }
 }
@@ -340,8 +325,8 @@ void serialEvent() {
 
         case 'D':
 
-            debug = !debug;
-            if (debug)
+            debugMode = !debugMode;
+            if (debugMode)
                 PrintCodeSerial(3081, "Debug is ON!", true);
             else
                 PrintCodeSerial(3081, "Debug is OFF!", true);
@@ -369,7 +354,7 @@ void serialEvent() {
             } else {
                 PrintCodeSerial(3005, "Calibration Sequence", true);
 
-                mpu.calibrateSensors(MPU9250::AXIS_Z);
+                mpu.calibrateSensors(MPU9250::AXIS_X);
                 SaveParams();
 
                 PrintCodeSerial(3007, "Calibration Complete", false);
