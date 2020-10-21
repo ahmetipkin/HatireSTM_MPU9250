@@ -146,13 +146,17 @@ void loop() {
         // NWU orientation
         //MahonyQuaternionUpdate(ay, -ax, az, gy * PI / 180.0f, -gx * PI / 180.0f, gz * PI / 180.0f, mx, -my, -mz, deltat);
 
-        MadgwickQuaternionUpdate(-ay, az, -ax, -gy * PI / 180.0f, gz * PI / 180.0f, -gx * PI / 180.0f, -mx, -mz, -my, deltat);
+       // MadgwickQuaternionUpdate(-ay, az, -ax, -gy * PI / 180.0f, gz * PI / 180.0f, -gx * PI / 180.0f, -mx, -mz, -my, deltat);
 
         // NWU orientation with chip looks to east. VCC to North
         //MahonyQuaternionUpdate(ay, az, ax, gy * PI / 180.0f, gz * PI / 180.0f, gx * PI / 180.0f, mx, -mz, my, deltat);
 
         // NWU orientation with FSYNC bottom; gyro Z+ to north
         //MadgwickQuaternionUpdate(az, ax, ay, gz * PI / 180.0f, gx * PI / 180.0f, gy * PI / 180.0f, -mz, my, mx, deltat);
+
+        // NWU orientation with gyro Z+ to north, pins up
+         MadgwickQuaternionUpdate(az, ay, -ax, gz * PI / 180.0f, gy * PI / 180.0f, -gx * PI / 180.0f, -mz, mx, -my, deltat);
+
 
         if (active) {
 
